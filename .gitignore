@@ -1,0 +1,21 @@
+# Compiled executable and object files
+proxy_server
+*.o
+
+# Runtime logs
+proxy.log
+*.log
+
+# Debugging backups
+*.bak
+*.before_framing_fix.c
+
+# Generated test results
+concurrency_results.txt
+*.tmp
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
