@@ -178,6 +178,61 @@ static int build_request(const HttpRequest *r, char *out, size_t cap)
         return -1;
     return (int)(used + (size_t)n);
 }
+
+
+static int parse_content_length(const char *headers, long long *length)
+{
+    const char *p = headers;
+    int found = 0;
+    *length = -1;
+
+    while (*p)
+    {
+        const char *end = strstr(p, "\r\n");
+        if (!end)
+            break;
+
+        if (end == p)
+            break;
+
+        const char *colon = memchr(p, ':', (size_t)(end - p));
+        if (colon && (size_t)(colon - p) == 14 &&
+            strncasecmp(p, "Content-Length", 14) == 0)
+        {
+            char value[32];
+            size_t len = (size_t)(end - colon - 1);
+
+            while (len > 0 && (colon[1] == ' ' || colon[1] == '\t'))
+            {
+                colon++;
+                len--;
+            }
+
+            if (len == 0 || len >= sizeof(value))
+                return -1;
+
+            memcpy(value, colon + 1, len);
+            value[len] = '\0';
+
+            char *tail;
+            errno = 0;
+            long long parsed = strtoll(value, &tail, 10);
+            if (errno || tail == value || *tail != '\0' || parsed < 0)
+                return -1;
+
+            if (found && parsed != *length)
+                return -1;
+
+            *length = parsed;
+            found = 1;
+        }
+
+        p = end + 2;
+    }
+
+    return found;
+}
+
 int forward_http_request(const HttpRequest *req, int client)
 {
     char key[4608], request[24576], buf[IO_BUFSZ];
@@ -209,7 +264,16 @@ int forward_http_request(const HttpRequest *req, int client)
         return send_error(client, 502, "Bad Gateway", "Could not send request to destination server\n");
     }
     size_t captured = 0;
-    int overflow = 0, first = 1, status = 0, receive_failed = 0;
+int overflow = 0, first = 1, status = 0, receive_failed = 0;
+char response_headers[32768];
+size_t header_bytes = 0;
+int headers_complete = 0;
+int has_content_length = 0;
+long long expected_body_bytes = -1;
+size_t response_body_bytes = 0;
+int response_incomplete = 0;
+int no_response_body = 0;
+    
     for (;;)
     {
         ssize_t n = recv(server, buf, sizeof(buf), 0);
@@ -225,10 +289,6 @@ int forward_http_request(const HttpRequest *req, int client)
             {
                 logger_log("WARN", "Destination response timed out");
 
-                /*
-                 * If no upstream response bytes have been received,
-                 * we can still send a valid HTTP 504 response.
-                 */
                 if (first)
                 {
                     close(server);
@@ -244,15 +304,117 @@ int forward_http_request(const HttpRequest *req, int client)
                 logger_log("ERROR", "Receive from destination failed");
             }
 
-            /*
-             * If response data has already started streaming,
-             * do not append a second HTTP status line.
-             */
             break;
         }
 
-        if (n == 0)
+                if (n == 0)
             break;
+
+        
+        if (first)
+        {
+            char tmp[64] = {0};
+            size_t z = (size_t)n < sizeof(tmp) - 1
+                           ? (size_t)n
+                           : sizeof(tmp) - 1;
+
+            memcpy(tmp, buf, z);
+
+            if (sscanf(tmp, "HTTP/%*s %d", &status) != 1)
+            {
+                response_incomplete = 1;
+                cacheable = 0;
+            }
+
+            first = 0;
+        }
+
+                if (!headers_complete)
+        {
+            size_t available = sizeof(response_headers) - 1 - header_bytes;
+            size_t copy_len = (size_t)n < available
+                                  ? (size_t)n
+                                  : available;
+
+            if (copy_len > 0)
+            {
+                memcpy(response_headers + header_bytes, buf, copy_len);
+                header_bytes += copy_len;
+                response_headers[header_bytes] = '\0';
+            }
+
+            char *header_end = strstr(response_headers, "\r\n\r\n");
+
+            if (header_end != NULL)
+            {
+                size_t header_end_offset =
+                    (size_t)(header_end + 4 - response_headers);
+
+                long long parsed_length = -1;
+                int parsed = parse_content_length(
+                    response_headers, &parsed_length);
+
+                headers_complete = 1;
+
+                if (parsed < 0)
+                {
+                    response_incomplete = 1;
+                    cacheable = 0;
+                }
+                else if (parsed == 1)
+                {
+                    has_content_length = 1;
+                    expected_body_bytes = parsed_length;
+                }
+
+                no_response_body =
+                    (status >= 100 && status < 200) ||
+                    status == 204 || status == 304;
+
+                if (header_bytes > header_end_offset)
+                {
+                    response_body_bytes +=
+                        header_bytes - header_end_offset;
+                }
+            }
+            else if (header_bytes == sizeof(response_headers) - 1)
+            {
+                response_incomplete = 1;
+                cacheable = 0;
+            }
+        }
+        else
+        {
+            response_body_bytes += (size_t)n;
+        }
+
+        if (has_content_length &&
+            !no_response_body &&
+            response_body_bytes > (size_t)expected_body_bytes)
+        {
+            response_incomplete = 1;
+            cacheable = 0;
+        }
+
+        if (cacheable && !overflow)
+        {
+            if (captured + (size_t)n < sizeof(cached))
+            {
+                memcpy(cached + captured, buf, (size_t)n);
+                captured += (size_t)n;
+            }
+            else
+            {
+                overflow = 1;
+            }
+        }
+
+        if (send_all(client, buf, (size_t)n) < 0)
+        {
+            logger_log("WARN", "Client disconnected while response was streaming");
+            cacheable = 0;
+            break;
+        }
         if (first)
         {
             char tmp[64] = {0};
@@ -279,13 +441,18 @@ int forward_http_request(const HttpRequest *req, int client)
         }
     }
     close(server);
-    // if (cacheable && !receive_failed && !overflow &&
-    //     captured > 0 && status >= 200 && status < 300)
-    // {
-    //     cache_put(key, cached, captured);
-    // }
-    if (cacheable && !receive_failed && !overflow &&
-    captured > 0 && status >= 200 && status < 300)
+    
+        if (headers_complete &&
+        !response_incomplete &&
+        (!has_content_length ||
+         no_response_body ||
+         response_body_bytes == (size_t)expected_body_bytes) &&
+        cacheable &&
+        !receive_failed &&
+        !overflow &&
+        captured > 0 &&
+        status >= 200 &&
+        status < 300)
 {
     cache_put(key, cached, captured);
     logger_log("INFO", "Cache STORE: response stored");

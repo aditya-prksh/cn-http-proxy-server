@@ -19,3 +19,4 @@ concurrency_results.txt
 .idea/
 .DS_Store
 Thumbs.db
+*.pre_response_fix
