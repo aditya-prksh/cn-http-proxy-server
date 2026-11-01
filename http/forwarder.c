@@ -415,31 +415,7 @@ int no_response_body = 0;
             cacheable = 0;
             break;
         }
-        if (first)
-        {
-            char tmp[64] = {0};
-            size_t z = (size_t)n < sizeof(tmp) - 1 ? (size_t)n : sizeof(tmp) - 1;
-            memcpy(tmp, buf, z);
-            sscanf(tmp, "HTTP/%*s %d", &status);
-            first = 0;
-        }
-        if (cacheable && !overflow)
-        {
-            if (captured + (size_t)n < sizeof(cached))
-            {
-                memcpy(cached + captured, buf, (size_t)n);
-                captured += (size_t)n;
-            }
-            else
-                overflow = 1;
-        }
-        if (send_all(client, buf, (size_t)n) < 0)
-        {
-            logger_log("WARN", "Client disconnected while response was streaming");
-            cacheable = 0;
-            break;
-        }
-    }
+
     close(server);
     
         if (headers_complete &&
